@@ -4,11 +4,13 @@ import hashlib
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from news_ingestion.schemas import NewsItem, SourceConfig
+
+MOSCOW_TZ = timezone(timedelta(hours=3))
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,7 @@ def initialize_database(database_path: str | Path) -> None:
                 ON news(published_at DESC);
             """
         )
+        _normalize_datetime_storage(conn)
 
 
 def connect(database_path: str | Path) -> sqlite3.Connection:
@@ -338,7 +341,7 @@ def _format_datetime(value: datetime | None) -> str | None:
         return None
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
-    return value.astimezone(UTC).isoformat()
+    return value.astimezone(MOSCOW_TZ).isoformat()
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -351,3 +354,26 @@ def _parse_datetime(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _normalize_datetime_storage(conn: sqlite3.Connection) -> None:
+    for table, columns in (
+        ("sources", ("last_seen_published_at", "last_polled_at")),
+        ("news", ("published_at", "fetched_at", "saved_at")),
+    ):
+        selected_columns = ", ".join(columns)
+        rows = conn.execute(f"SELECT rowid, {selected_columns} FROM {table}").fetchall()
+        for row in rows:
+            updates: dict[str, str] = {}
+            for column in columns:
+                parsed = _parse_datetime(row[column])
+                formatted = _format_datetime(parsed)
+                if formatted is not None and formatted != row[column]:
+                    updates[column] = formatted
+            if not updates:
+                continue
+            assignments = ", ".join(f"{column} = ?" for column in updates)
+            conn.execute(
+                f"UPDATE {table} SET {assignments} WHERE rowid = ?",
+                (*updates.values(), row["rowid"]),
+            )

@@ -59,3 +59,59 @@ def test_save_news_item_upserts_by_source_and_external_id(tmp_path) -> None:
     assert row["text"] == "longer text with more complete article body"
     assert row["confidence"] == 0.5
     assert '"version": 43' in row["raw_json"]
+
+
+def test_timestamps_are_stored_with_moscow_offset(tmp_path) -> None:
+    db_path = tmp_path / "news.sqlite3"
+    initialize_database(db_path)
+    sync_sources(db_path, [_source()])
+
+    save_news_item(db_path, _item("fresh text"))
+
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT published_at, fetched_at, saved_at FROM news"
+        ).fetchone()
+
+    assert row["published_at"] == "2026-05-23T12:00:00+03:00"
+    assert row["fetched_at"] == "2026-05-23T12:01:00+03:00"
+    assert row["saved_at"].endswith("+03:00")
+
+
+def test_initialize_database_migrates_existing_utc_timestamps_to_moscow(tmp_path) -> None:
+    db_path = tmp_path / "news.sqlite3"
+    initialize_database(db_path)
+    sync_sources(db_path, [_source()])
+
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO news (
+                id, source_id, external_id, url, source_type, title, text, summary,
+                published_at, fetched_at, saved_at, confidence, raw_json
+            )
+            VALUES (
+                'legacy', 'test_source', 'legacy-id', 'https://example.com/legacy',
+                'fast_agency', 'Legacy', 'Legacy text', NULL,
+                '2026-05-23T09:00:00+00:00',
+                '2026-05-23T09:01:00+00:00',
+                '2026-05-23T09:02:00+00:00',
+                0.5, NULL
+            )
+            """
+        )
+
+    initialize_database(db_path)
+
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT published_at, fetched_at, saved_at
+            FROM news
+            WHERE id = 'legacy'
+            """
+        ).fetchone()
+
+    assert row["published_at"] == "2026-05-23T12:00:00+03:00"
+    assert row["fetched_at"] == "2026-05-23T12:01:00+03:00"
+    assert row["saved_at"] == "2026-05-23T12:02:00+03:00"
