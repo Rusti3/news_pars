@@ -27,13 +27,34 @@ python -m pip install -e ".[dev]"
 copy .env.example .env
 news-pars init-db
 news-pars list-sources
+news-pars bootstrap
 news-pars ingest moex_news
 news-pars run
 ```
 
-По умолчанию БД пишется в `news.sqlite3`. Повторная новость не добавляется второй
-строкой: запись обновляется по `source_id + external_id`, если появился более
-полный текст или метаданные.
+По умолчанию БД пишется в `news.sqlite3`. Таблица `news` хранит минимальную
+append-only запись:
+
+```json
+{
+  "news_id": "source:external_id_or_hash",
+  "source": "interfax",
+  "published_at_msk": "2026-05-21 12:03:18",
+  "received_at_msk": "2026-05-21 12:03:25",
+  "title": "...",
+  "text": "...",
+  "url": "...",
+  "raw_payload_hash": "..."
+}
+```
+
+Повторный приход той же новости игнорируется по `news_id`; уже сохраненные строки
+не обновляются.
+
+При `news-pars run` перед постоянным polling запускается bootstrap: каждый enabled
+источник расширенно сканируется, сохраняются новости за последние сутки, а если у
+источника таких новостей нет - последние 3 доступные новости. Отдельно этот проход
+можно запустить командой `news-pars bootstrap`.
 
 HTML-источники работают в real-time режиме: каждый проход смотрит только верхние
 `max_items` ссылок из списка источника. Если эти ссылки уже есть в базе, адаптер

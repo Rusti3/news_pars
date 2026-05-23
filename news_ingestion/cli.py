@@ -19,6 +19,7 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("init-db")
     subparsers.add_parser("list-sources")
+    subparsers.add_parser("bootstrap")
 
     ingest_parser = subparsers.add_parser("ingest")
     ingest_parser.add_argument("source_id", nargs="?")
@@ -47,6 +48,12 @@ def main() -> None:
         print(f"total rows: {count_news(settings.database_path)}")
         return
 
+    if args.command == "bootstrap":
+        results = asyncio.run(pipeline.bootstrap())
+        _print_stats(results)
+        print(f"total rows: {count_news(settings.database_path)}")
+        return
+
     if args.command == "run":
         asyncio.run(_run_scheduler(pipeline, settings))
         return
@@ -63,6 +70,13 @@ async def _run_ingest(
 
 async def _run_scheduler(pipeline: IngestionPipeline, settings: Settings) -> None:
     pipeline.initialize()
+    if settings.bootstrap_enabled:
+        print(
+            f"bootstrap started: last {settings.bootstrap_lookback_days} day(s), "
+            f"fallback={settings.bootstrap_fallback_items}"
+        )
+        _print_stats(await pipeline.bootstrap())
+        print(f"bootstrap finished: total rows={count_news(settings.database_path)}")
     scheduler = create_scheduler(pipeline)
     scheduler.start()
     print(
@@ -85,8 +99,9 @@ def _print_sources(registry: SourceRegistry) -> None:
 def _print_stats(results: Iterable[SourceRunStats]) -> None:
     for result in results:
         print(
-            f"{result.source_id}: fetched={result.fetched} saved={result.saved} "
-            f"updated={result.updated} skipped={result.skipped} "
+            f"{result.source_id} [{result.mode}]: fetched={result.fetched} "
+            f"selected={result.selected} saved={result.saved} "
+            f"duplicates={result.duplicates} skipped={result.skipped} "
             f"errors={len(result.errors)} duration={result.duration_seconds}s"
         )
         for error in result.errors:

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from threading import Lock
 
 from news_ingestion.adapters import build_adapter
 from news_ingestion.cleaning import clean_text
 from news_ingestion.config import SourceRegistry
-from news_ingestion.schemas import NewsItem, SourceConfig
+from news_ingestion.schemas import NewsItem, ParserConfig, SourceConfig
 from news_ingestion.settings import Settings
 from news_ingestion.storage import (
     SourceWatermark,
@@ -23,9 +23,11 @@ from news_ingestion.storage import (
 @dataclass
 class SourceRunStats:
     source_id: str
+    mode: str = "realtime"
     fetched: int = 0
+    selected: int = 0
     saved: int = 0
-    updated: int = 0
+    duplicates: int = 0
     skipped: int = 0
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -86,10 +88,25 @@ class IngestionPipeline:
             results.append(await self.run_source(source.id))
         return results
 
-    async def run_source(self, source_id: str) -> SourceRunStats:
+    async def bootstrap(self) -> list[SourceRunStats]:
         self.initialize()
-        source = self.get_source(source_id)
-        stats = SourceRunStats(source_id=source.id, started_at=datetime.now(UTC))
+        results: list[SourceRunStats] = []
+        for source in self.enabled_sources():
+            results.append(await self.run_source(source.id, bootstrap=True))
+        return results
+
+    async def run_source(self, source_id: str, *, bootstrap: bool = False) -> SourceRunStats:
+        self.initialize()
+        base_source = self.get_source(source_id)
+        source = _with_max_items(
+            base_source,
+            self.settings.bootstrap_max_items_per_source,
+        ) if bootstrap else base_source
+        stats = SourceRunStats(
+            source_id=source.id,
+            mode="bootstrap" if bootstrap else "realtime",
+            started_at=datetime.now(UTC),
+        )
 
         if not source.enabled:
             stats.errors.append("source is disabled")
@@ -108,7 +125,10 @@ class IngestionPipeline:
                     watermark.last_seen_external_id,
                     watermark.last_seen_published_at,
                 )
-            await self._stream_source_items(adapter, source, stats, watermark)
+            if bootstrap:
+                await self._bootstrap_source_items(adapter, source, stats)
+            else:
+                await self._stream_source_items(adapter, source, stats, watermark)
         except Exception as exc:
             stats.errors.append(str(exc))
 
@@ -128,9 +148,48 @@ class IngestionPipeline:
             stats.fetched += 1
             item.discovered_at = datetime.now(UTC)
             if _is_older_than_watermark(item, watermark):
-                stats.updated += 1
+                stats.duplicates += 1
                 continue
 
+            normalized = normalize_item(item, source)
+            if normalized is None:
+                stats.skipped += 1
+                continue
+
+            stats.selected += 1
+            result = save_news_item(self.settings.database_path, normalized)
+            watermark_accumulator.observe(normalized)
+            if result.created:
+                stats.saved += 1
+            else:
+                stats.duplicates += 1
+
+        update_source_watermark(
+            self.settings.database_path,
+            source.id,
+            external_id=watermark_accumulator.external_id,
+            published_at=watermark_accumulator.published_at,
+            polled_at=datetime.now(UTC),
+        )
+
+    async def _bootstrap_source_items(
+        self,
+        adapter,
+        source: SourceConfig,
+        stats: SourceRunStats,
+    ) -> None:
+        fetched_items: list[NewsItem] = []
+        async for item in adapter.iter_items():
+            stats.fetched += 1
+            item.discovered_at = datetime.now(UTC)
+            fetched_items.append(item)
+
+        selected_items = self._select_bootstrap_items(fetched_items)
+        stats.selected = len(selected_items)
+        stats.skipped += max(0, stats.fetched - stats.selected)
+
+        watermark_accumulator = WatermarkAccumulator()
+        for item in selected_items:
             normalized = normalize_item(item, source)
             if normalized is None:
                 stats.skipped += 1
@@ -141,7 +200,7 @@ class IngestionPipeline:
             if result.created:
                 stats.saved += 1
             else:
-                stats.updated += 1
+                stats.duplicates += 1
 
         update_source_watermark(
             self.settings.database_path,
@@ -150,6 +209,17 @@ class IngestionPipeline:
             published_at=watermark_accumulator.published_at,
             polled_at=datetime.now(UTC),
         )
+
+    def _select_bootstrap_items(self, items: list[NewsItem]) -> list[NewsItem]:
+        cutoff = datetime.now(UTC) - timedelta(days=self.settings.bootstrap_lookback_days)
+        recent_items = [
+            item
+            for item in items
+            if item.published_at is not None and _as_utc(item.published_at) >= cutoff
+        ]
+        if recent_items:
+            return recent_items
+        return items[: self.settings.bootstrap_fallback_items]
 
 
 def normalize_item(item: NewsItem, source: SourceConfig) -> NewsItem | None:
@@ -176,5 +246,18 @@ def _is_older_than_watermark(item: NewsItem, watermark: SourceWatermark) -> bool
     return (
         item.published_at is not None
         and watermark.last_seen_published_at is not None
-        and item.published_at < watermark.last_seen_published_at
+        and _as_utc(item.published_at) < watermark.last_seen_published_at
     )
+
+
+def _with_max_items(source: SourceConfig, max_items: int) -> SourceConfig:
+    parser = source.parser or ParserConfig()
+    return source.model_copy(
+        update={"parser": parser.model_copy(update={"max_items": max_items})}
+    )
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)

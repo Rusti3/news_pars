@@ -39,7 +39,7 @@ def _item(text: str) -> NewsItem:
     )
 
 
-def test_save_news_item_upserts_by_source_and_external_id(tmp_path) -> None:
+def test_save_news_item_is_append_only_and_ignores_duplicate_news_id(tmp_path) -> None:
     db_path = tmp_path / "news.sqlite3"
     initialize_database(db_path)
     sync_sources(db_path, [_source()])
@@ -50,15 +50,19 @@ def test_save_news_item_upserts_by_source_and_external_id(tmp_path) -> None:
     assert first.created is True
     assert second.created is False
     assert first.news_id == second.news_id
+    assert first.news_id == "test_source:https://example.com/news/1"
     assert count_news(db_path) == 1
     assert known_external_ids(db_path, "test_source") == {"https://example.com/news/1"}
 
     with connect(db_path) as conn:
-        row = conn.execute("SELECT text, confidence, raw_json FROM news").fetchone()
+        row = conn.execute(
+            "SELECT news_id, source, text, raw_payload_hash FROM news"
+        ).fetchone()
 
-    assert row["text"] == "longer text with more complete article body"
-    assert row["confidence"] == 0.5
-    assert '"version": 43' in row["raw_json"]
+    assert row["news_id"] == "test_source:https://example.com/news/1"
+    assert row["source"] == "test_source"
+    assert row["text"] == "short text"
+    assert len(row["raw_payload_hash"]) == 64
 
 
 def test_timestamps_are_stored_with_moscow_offset(tmp_path) -> None:
@@ -70,12 +74,11 @@ def test_timestamps_are_stored_with_moscow_offset(tmp_path) -> None:
 
     with connect(db_path) as conn:
         row = conn.execute(
-            "SELECT published_at, fetched_at, saved_at FROM news"
+            "SELECT published_at_msk, received_at_msk FROM news"
         ).fetchone()
 
-    assert row["published_at"] == "2026-05-23T12:00:00+03:00"
-    assert row["fetched_at"] == "2026-05-23T12:01:00+03:00"
-    assert row["saved_at"].endswith("+03:00")
+    assert row["published_at_msk"] == "2026-05-23 12:00:00"
+    assert row["received_at_msk"].startswith("2026-")
 
 
 def test_initialize_database_migrates_existing_utc_timestamps_to_moscow(tmp_path) -> None:
@@ -84,8 +87,26 @@ def test_initialize_database_migrates_existing_utc_timestamps_to_moscow(tmp_path
     sync_sources(db_path, [_source()])
 
     with connect(db_path) as conn:
-        conn.execute(
+        conn.executescript(
             """
+            DROP INDEX IF EXISTS ix_news_source_received_at;
+            DROP INDEX IF EXISTS ix_news_published_at_msk;
+            ALTER TABLE news RENAME TO news_old_minimal;
+            CREATE TABLE news (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL,
+                external_id TEXT,
+                url TEXT,
+                source_type TEXT NOT NULL,
+                title TEXT,
+                text TEXT NOT NULL,
+                summary TEXT,
+                published_at TEXT,
+                fetched_at TEXT NOT NULL,
+                saved_at TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                raw_json TEXT
+            );
             INSERT INTO news (
                 id, source_id, external_id, url, source_type, title, text, summary,
                 published_at, fetched_at, saved_at, confidence, raw_json
@@ -106,12 +127,13 @@ def test_initialize_database_migrates_existing_utc_timestamps_to_moscow(tmp_path
     with connect(db_path) as conn:
         row = conn.execute(
             """
-            SELECT published_at, fetched_at, saved_at
+            SELECT news_id, source, published_at_msk, received_at_msk
             FROM news
-            WHERE id = 'legacy'
+            WHERE news_id = 'test_source:legacy-id'
             """
         ).fetchone()
 
-    assert row["published_at"] == "2026-05-23T12:00:00+03:00"
-    assert row["fetched_at"] == "2026-05-23T12:01:00+03:00"
-    assert row["saved_at"] == "2026-05-23T12:02:00+03:00"
+    assert row["news_id"] == "test_source:legacy-id"
+    assert row["source"] == "test_source"
+    assert row["published_at_msk"] == "2026-05-23 12:00:00"
+    assert row["received_at_msk"] == "2026-05-23 12:02:00"

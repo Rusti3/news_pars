@@ -6,11 +6,11 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
 
 from news_ingestion.schemas import NewsItem, SourceConfig
 
 MOSCOW_TZ = timezone(timedelta(hours=3))
+MSK_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 @dataclass(frozen=True)
@@ -48,28 +48,15 @@ def initialize_database(database_path: str | Path) -> None:
                 last_seen_published_at TEXT,
                 last_polled_at TEXT
             );
-
-            CREATE TABLE IF NOT EXISTS news (
-                id TEXT PRIMARY KEY,
-                source_id TEXT NOT NULL REFERENCES sources(id),
-                external_id TEXT,
-                url TEXT,
-                source_type TEXT NOT NULL,
-                title TEXT,
-                text TEXT NOT NULL,
-                summary TEXT,
-                published_at TEXT,
-                fetched_at TEXT NOT NULL,
-                saved_at TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                raw_json TEXT,
-                UNIQUE(source_id, external_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS ix_news_source_saved_at
-                ON news(source_id, saved_at DESC);
-            CREATE INDEX IF NOT EXISTS ix_news_published_at
-                ON news(published_at DESC);
+            """
+        )
+        _ensure_news_table(conn)
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS ix_news_source_received_at
+                ON news(source, received_at_msk DESC);
+            CREATE INDEX IF NOT EXISTS ix_news_published_at_msk
+                ON news(published_at_msk DESC);
             """
         )
         _normalize_datetime_storage(conn)
@@ -121,16 +108,21 @@ def sync_sources(database_path: str | Path, sources: list[SourceConfig]) -> int:
 
 def known_external_ids(database_path: str | Path, source_id: str) -> set[str]:
     initialize_database(database_path)
+    prefix = f"{source_id}:"
     with connect(database_path) as conn:
         rows = conn.execute(
             """
-            SELECT external_id
+            SELECT news_id
             FROM news
-            WHERE source_id = ? AND external_id IS NOT NULL
+            WHERE source = ?
             """,
             (source_id,),
         )
-        return {str(row["external_id"]) for row in rows if row["external_id"]}
+    return {
+        str(row["news_id"])[len(prefix) :]
+        for row in rows
+        if str(row["news_id"]).startswith(prefix)
+    }
 
 
 def get_source_watermark(database_path: str | Path, source_id: str) -> SourceWatermark:
@@ -194,42 +186,31 @@ def update_source_watermark(
 
 def save_news_item(database_path: str | Path, item: NewsItem) -> SaveResult:
     initialize_database(database_path)
-    now = datetime.now(UTC)
-    item.saved_at = item.saved_at or now
-    news_id = _news_id(item)
+    item.saved_at = item.saved_at or datetime.now(UTC)
+    raw_payload_hash = _raw_payload_hash(item)
+    news_id = _news_id(item, raw_payload_hash)
 
     with connect(database_path) as conn:
-        existing = _find_existing(conn, item, news_id)
-        if existing is None:
-            conn.execute(
-                """
-                INSERT INTO news (
-                    id, source_id, external_id, url, source_type, title, text, summary,
-                    published_at, fetched_at, saved_at, confidence, raw_json
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                _insert_payload(news_id, item),
-            )
-            return SaveResult(news_id=news_id, created=True)
-
-        conn.execute(
+        cursor = conn.execute(
             """
-            UPDATE news
-            SET url = ?,
-                title = ?,
-                text = ?,
-                summary = ?,
-                published_at = ?,
-                fetched_at = ?,
-                saved_at = ?,
-                confidence = ?,
-                raw_json = ?
-            WHERE id = ?
+            INSERT OR IGNORE INTO news (
+                news_id, source, published_at_msk, received_at_msk,
+                title, text, url, raw_payload_hash
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            _update_payload(existing, item),
+            (
+                news_id,
+                item.source_id,
+                _format_datetime(item.published_at),
+                _format_datetime(item.saved_at),
+                item.title,
+                item.text,
+                item.url,
+                raw_payload_hash,
+            ),
         )
-        return SaveResult(news_id=str(existing["id"]), created=False)
+    return SaveResult(news_id=news_id, created=cursor.rowcount > 0)
 
 
 def count_news(database_path: str | Path) -> int:
@@ -239,109 +220,126 @@ def count_news(database_path: str | Path) -> int:
     return int(row["count"])
 
 
-def _find_existing(
-    conn: sqlite3.Connection,
-    item: NewsItem,
-    news_id: str,
-) -> sqlite3.Row | None:
-    if item.external_id:
-        row = conn.execute(
+def _ensure_news_table(conn: sqlite3.Connection) -> None:
+    columns = _table_columns(conn, "news")
+    if columns and _is_minimal_news_schema(columns):
+        return
+
+    legacy_table: str | None = None
+    if columns:
+        conn.execute("DROP INDEX IF EXISTS ix_news_source_saved_at")
+        conn.execute("DROP INDEX IF EXISTS ix_news_published_at")
+        conn.execute("DROP INDEX IF EXISTS ix_news_source_received_at")
+        conn.execute("DROP INDEX IF EXISTS ix_news_published_at_msk")
+        legacy_table = f"news_legacy_{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}"
+        conn.execute(f"ALTER TABLE news RENAME TO {legacy_table}")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS news (
+            news_id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            published_at_msk TEXT,
+            received_at_msk TEXT NOT NULL,
+            title TEXT,
+            text TEXT NOT NULL,
+            url TEXT,
+            raw_payload_hash TEXT NOT NULL
+        )
+        """
+    )
+
+    if legacy_table:
+        _copy_legacy_news(conn, legacy_table)
+
+
+def _copy_legacy_news(conn: sqlite3.Connection, legacy_table: str) -> None:
+    legacy_columns = _table_columns(conn, legacy_table)
+    if "source_id" not in legacy_columns:
+        return
+
+    rows = conn.execute(f"SELECT * FROM {legacy_table}").fetchall()
+    for row in rows:
+        source = row["source_id"]
+        text = row["text"] or ""
+        if not source or not text:
+            continue
+        raw_payload_hash = _hash_text(
+            row["raw_json"]
+            or json.dumps(
+                {
+                    "title": row["title"],
+                    "text": text,
+                    "url": row["url"],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        external_or_hash = row["external_id"] or row["id"] or raw_payload_hash
+        conn.execute(
             """
-            SELECT *
-            FROM news
-            WHERE source_id = ? AND external_id = ?
+            INSERT OR IGNORE INTO news (
+                news_id, source, published_at_msk, received_at_msk,
+                title, text, url, raw_payload_hash
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (item.source_id, item.external_id),
-        ).fetchone()
-        if row is not None:
-            return row
-    return conn.execute("SELECT * FROM news WHERE id = ?", (news_id,)).fetchone()
+            (
+                f"{source}:{external_or_hash}",
+                source,
+                _format_datetime(_parse_datetime(row["published_at"])),
+                _format_datetime(_parse_datetime(row["saved_at"] or row["fetched_at"])),
+                row["title"],
+                text,
+                row["url"],
+                raw_payload_hash,
+            ),
+        )
 
 
-def _insert_payload(news_id: str, item: NewsItem) -> tuple[Any, ...]:
-    return (
-        news_id,
-        item.source_id,
-        item.external_id,
-        item.url,
-        item.source_type,
-        item.title,
-        item.text,
-        item.summary,
-        _format_datetime(item.published_at),
-        _format_datetime(item.fetched_at),
-        _format_datetime(item.saved_at),
-        item.confidence,
-        _json_dumps(item.raw),
-    )
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {row["name"] for row in rows}
 
 
-def _update_payload(existing: sqlite3.Row, item: NewsItem) -> tuple[Any, ...]:
-    title = _best_text(existing["title"], item.title)
-    text = _best_text(existing["text"], item.text)
-    summary = _best_text(existing["summary"], item.summary)
-    published_at = existing["published_at"] or _format_datetime(item.published_at)
-    raw_json = _merge_raw(existing["raw_json"], item.raw)
-    confidence = max(float(existing["confidence"] or 0.0), item.confidence)
-
-    return (
-        item.url or existing["url"],
-        title,
-        text,
-        summary,
-        published_at,
-        _format_datetime(item.fetched_at),
-        _format_datetime(item.saved_at),
-        confidence,
-        raw_json,
-        existing["id"],
-    )
+def _is_minimal_news_schema(columns: set[str]) -> bool:
+    return {
+        "news_id",
+        "source",
+        "published_at_msk",
+        "received_at_msk",
+        "title",
+        "text",
+        "url",
+        "raw_payload_hash",
+    }.issubset(columns)
 
 
-def _best_text(current: str | None, incoming: str | None) -> str | None:
-    if not incoming:
-        return current
-    if not current or len(incoming) > len(current):
-        return incoming
-    return current
+def _news_id(item: NewsItem, raw_payload_hash: str) -> str:
+    external_or_hash = item.external_id or raw_payload_hash
+    return f"{item.source_id}:{external_or_hash}"
 
 
-def _merge_raw(current: str | None, incoming: dict[str, Any] | None) -> str | None:
-    if not incoming:
-        return current
-    if not current:
-        return _json_dumps(incoming)
-    try:
-        current_payload = json.loads(current)
-    except json.JSONDecodeError:
-        current_payload = {"previous_raw_json": current}
-    if isinstance(current_payload, dict):
-        current_payload.update(incoming)
-        return _json_dumps(current_payload)
-    return _json_dumps(incoming)
+def _raw_payload_hash(item: NewsItem) -> str:
+    payload = item.raw if item.raw is not None else {
+        "title": item.title,
+        "text": item.text,
+        "url": item.url,
+    }
+    return _hash_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
 
 
-def _news_id(item: NewsItem) -> str:
-    return _stable_id(item.source_id, item.external_id, item.url, item.title, item.text)
-
-
-def _stable_id(*parts: str | None) -> str:
-    payload = "\x1f".join(part or "" for part in parts)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _json_dumps(value: dict[str, Any] | None) -> str | None:
-    if value is None:
-        return None
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+def _hash_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _format_datetime(value: datetime | None) -> str | None:
     if value is None:
         return None
     if value.tzinfo is None:
-        value = value.replace(tzinfo=UTC)
-    return value.astimezone(MOSCOW_TZ).isoformat()
+        value = value.replace(tzinfo=MOSCOW_TZ)
+    return value.astimezone(MOSCOW_TZ).strftime(MSK_FORMAT)
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -350,16 +348,19 @@ def _parse_datetime(value: str | None) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError:
-        return None
+        try:
+            parsed = datetime.strptime(value, MSK_FORMAT)
+        except ValueError:
+            return None
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
+        return parsed.replace(tzinfo=MOSCOW_TZ).astimezone(UTC)
     return parsed.astimezone(UTC)
 
 
 def _normalize_datetime_storage(conn: sqlite3.Connection) -> None:
     for table, columns in (
         ("sources", ("last_seen_published_at", "last_polled_at")),
-        ("news", ("published_at", "fetched_at", "saved_at")),
+        ("news", ("published_at_msk", "received_at_msk")),
     ):
         selected_columns = ", ".join(columns)
         rows = conn.execute(f"SELECT rowid, {selected_columns} FROM {table}").fetchall()
