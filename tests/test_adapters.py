@@ -1,5 +1,6 @@
 from datetime import UTC
 
+import httpx
 import pytest
 
 from news_ingestion.adapters.disclosure import _parse_message_detail, _parse_message_list
@@ -73,6 +74,17 @@ class StubHTMLAdapter(HTMLNewsAdapter):
         """
 
 
+class PartiallyBrokenHTMLAdapter(StubHTMLAdapter):
+    async def extract_article(self, url: str):
+        if url.endswith("item-1"):
+            raise httpx.HTTPStatusError(
+                "not found",
+                request=httpx.Request("GET", url),
+                response=httpx.Response(404),
+            )
+        return await super().extract_article(url)
+
+
 @pytest.mark.asyncio
 async def test_html_adapter_discovers_and_extracts_article(tmp_path) -> None:
     config = SourceConfig(
@@ -130,6 +142,32 @@ async def test_html_adapter_does_not_backfill_known_top_links(tmp_path) -> None:
     links = await adapter.discover_article_links()
 
     assert links == []
+
+
+@pytest.mark.asyncio
+async def test_html_adapter_skips_broken_article_links(tmp_path) -> None:
+    config = SourceConfig(
+        id="html_source",
+        name="HTML Source",
+        type="media_analysis",
+        method="html",
+        url="https://example.com/news",
+        interval_seconds=30,
+        trust_score=0.7,
+        parser={
+            "list_item_selector": "a[href]",
+            "title_selector": "h1",
+            "article_selector": "article",
+            "link_allow_patterns": ["/news/"],
+            "max_items": 2,
+        },
+    )
+    adapter = PartiallyBrokenHTMLAdapter(config, _settings(tmp_path))
+
+    items = [item async for item in adapter.iter_items()]
+
+    assert len(items) == 1
+    assert items[0].external_id == "https://example.com/news/item-2"
 
 
 def test_disclosure_parser_reads_list_and_detail() -> None:

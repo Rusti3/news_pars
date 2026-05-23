@@ -43,7 +43,8 @@ sources:
       list_item_selector: "a[href]"
       title_selector: "h1"
       article_selector: "article"
-      link_allow_patterns: ["/press/releases/"]
+      link_allow_patterns: ["/press/releases/item/"]
+      link_block_patterns: ["/press/releases/rss", "/press/releases/20"]
       max_items: 2
 
   - id: gazprom_official_news
@@ -74,7 +75,7 @@ sources:
       list_item_selector: "a[href]"
       title_selector: "h1"
       article_selector: "article"
-      link_allow_patterns: ["/ir/", "/press/"]
+      link_allow_patterns: ["/ir/news/", "/about/press/news/"]
       max_items: 2
 
   - id: yandex_official_ir
@@ -89,7 +90,7 @@ sources:
       list_item_selector: "a[href]"
       title_selector: "h1"
       article_selector: "article"
-      link_allow_patterns: ["/press-releases", "/financial-releases"]
+      link_allow_patterns: ["/press-releases?year="]
       max_items: 2
 
   - id: polyus_official_news
@@ -105,6 +106,7 @@ sources:
       title_selector: "h1"
       article_selector: "article"
       link_allow_patterns: ["/ru/media/news/"]
+      link_block_patterns: ["?lang="]
       max_items: 2
 
   - id: tbank_official_ir
@@ -119,7 +121,7 @@ sources:
       list_item_selector: "a[href]"
       title_selector: "h1"
       article_selector: "article"
-      link_allow_patterns: ["/about/investors/", "/results/", "/news"]
+      link_allow_patterns: ["/about/news/20", "/about/financial-news/20"]
       max_items: 2
 
   - id: novatek_official_releases
@@ -134,7 +136,8 @@ sources:
       list_item_selector: "a[href]"
       title_selector: "h1"
       article_selector: "article"
-      link_allow_patterns: ["/ru/press/releases/"]
+      link_allow_patterns: ["/ru/press/releases/index.php?id_4="]
+      link_block_patterns: ["newsFilterFormMode", "from_4=", "/archive/"]
       max_items: 2
 
   - id: x5_official_releases
@@ -149,7 +152,7 @@ sources:
       list_item_selector: "a[href]"
       title_selector: "h1"
       article_selector: "article"
-      link_allow_patterns: ["/ru/press-center/press-releases/", "/ru/investors/"]
+      link_allow_patterns: ["/ru/news/"]
       max_items: 2
 
   - id: nornickel_official_releases
@@ -243,7 +246,8 @@ sources:
       list_item_selector: "a[href]"
       title_selector: "h1"
       article_selector: "article"
-      link_allow_patterns: ["/ru/media-center/press-releases/", "/ru/ir/results/ir-releases/"]
+      link_allow_patterns: ["/ru/media-center/press-releases/"]
+      link_block_patterns: ["?PAGEN_"]
       max_items: 2
 
   - id: moex_news
@@ -443,7 +447,8 @@ sources:
       list_item_selector: "a[href]"
       title_selector: "h1"
       article_selector: "article"
-      link_allow_patterns: ["/news/lenta/"]
+      link_allow_patterns: ["/news/lenta/?id="]
+      link_block_patterns: ["bankiru_news_daytheme"]
       max_items: 2
 
   - id: investfuture_news

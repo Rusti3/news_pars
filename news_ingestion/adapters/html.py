@@ -27,7 +27,10 @@ class HTMLNewsAdapter(NewsSourceAdapter):
     async def iter_items(self) -> AsyncIterator[NewsItem]:
         links = await self.discover_article_links()
         for link in links:
-            article = await self.extract_article(link)
+            try:
+                article = await self.extract_article(link)
+            except httpx.HTTPError:
+                continue
             if article is not None:
                 yield article
 
@@ -148,4 +151,4 @@ class HTMLNewsAdapter(NewsSourceAdapter):
 
 def _normalize_url(url: str) -> str:
     clean, _fragment = urldefrag(url)
-    return clean.rstrip("/")
+    return clean
