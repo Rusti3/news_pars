@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from typing import Protocol
 
 from news_ingestion.schemas import NewsItem, SourceConfig
 
@@ -24,6 +26,12 @@ class SourceWatermark:
     last_seen_external_id: str | None = None
     last_seen_published_at: datetime | None = None
     last_polled_at: datetime | None = None
+
+
+class TickerMatchLike(Protocol):
+    ticker: str
+    matched_by: str
+    matched_terms: tuple[str, ...]
 
 
 def initialize_database(database_path: str | Path) -> None:
@@ -51,6 +59,7 @@ def initialize_database(database_path: str | Path) -> None:
             """
         )
         _ensure_news_table(conn)
+        _ensure_ticker_tables(conn)
         _ensure_story_tables(conn)
         conn.executescript(
             """
@@ -185,20 +194,30 @@ def update_source_watermark(
         )
 
 
-def save_news_item(database_path: str | Path, item: NewsItem) -> SaveResult:
+def save_news_item(
+    database_path: str | Path,
+    item: NewsItem,
+    *,
+    ticker_matches: Sequence[TickerMatchLike] | None = None,
+) -> SaveResult:
     initialize_database(database_path)
     item.saved_at = item.saved_at or datetime.now(UTC)
     raw_payload_hash = _raw_payload_hash(item)
     news_id = _news_id(item, raw_payload_hash)
+    ticker_matches = ticker_matches or ()
+    tickers_json = json.dumps(
+        [match.ticker for match in ticker_matches],
+        ensure_ascii=False,
+    )
 
     with connect(database_path) as conn:
         cursor = conn.execute(
             """
             INSERT OR IGNORE INTO news (
                 news_id, source, published_at_msk, received_at_msk,
-                title, text, url, raw_payload_hash
+                title, text, url, raw_payload_hash, tickers_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 news_id,
@@ -209,8 +228,11 @@ def save_news_item(database_path: str | Path, item: NewsItem) -> SaveResult:
                 item.text,
                 item.url,
                 raw_payload_hash,
+                tickers_json,
             ),
         )
+        if cursor.rowcount > 0:
+            replace_news_tickers(conn, news_id, ticker_matches)
     return SaveResult(news_id=news_id, created=cursor.rowcount > 0)
 
 
@@ -224,6 +246,8 @@ def count_news(database_path: str | Path) -> int:
 def _ensure_news_table(conn: sqlite3.Connection) -> None:
     columns = _table_columns(conn, "news")
     if columns and _is_minimal_news_schema(columns):
+        if "tickers_json" not in columns:
+            conn.execute("ALTER TABLE news ADD COLUMN tickers_json TEXT NOT NULL DEFAULT '[]'")
         return
 
     legacy_table: str | None = None
@@ -245,13 +269,32 @@ def _ensure_news_table(conn: sqlite3.Connection) -> None:
             title TEXT,
             text TEXT NOT NULL,
             url TEXT,
-            raw_payload_hash TEXT NOT NULL
+            raw_payload_hash TEXT NOT NULL,
+            tickers_json TEXT NOT NULL DEFAULT '[]'
         )
         """
     )
 
     if legacy_table:
         _copy_legacy_news(conn, legacy_table)
+
+
+def _ensure_ticker_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS news_tickers (
+            news_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            matched_by TEXT NOT NULL,
+            matched_terms_json TEXT NOT NULL,
+            created_at_msk TEXT NOT NULL,
+            PRIMARY KEY(news_id, ticker),
+            FOREIGN KEY(news_id) REFERENCES news(news_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS ix_news_tickers_ticker
+            ON news_tickers(ticker);
+        """
+    )
 
 
 def _ensure_story_tables(conn: sqlite3.Connection) -> None:
@@ -314,9 +357,9 @@ def _copy_legacy_news(conn: sqlite3.Connection, legacy_table: str) -> None:
             """
             INSERT OR IGNORE INTO news (
                 news_id, source, published_at_msk, received_at_msk,
-                title, text, url, raw_payload_hash
+                title, text, url, raw_payload_hash, tickers_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 f"{source}:{external_or_hash}",
@@ -327,6 +370,7 @@ def _copy_legacy_news(conn: sqlite3.Connection, legacy_table: str) -> None:
                 text,
                 row["url"],
                 raw_payload_hash,
+                "[]",
             ),
         )
 
@@ -347,6 +391,46 @@ def _is_minimal_news_schema(columns: set[str]) -> bool:
         "url",
         "raw_payload_hash",
     }.issubset(columns)
+
+
+def replace_news_tickers(
+    conn: sqlite3.Connection,
+    news_id: str,
+    ticker_matches: Sequence[TickerMatchLike],
+) -> None:
+    tickers = [match.ticker for match in ticker_matches]
+    now_msk = _format_datetime(datetime.now(UTC))
+    conn.execute(
+        """
+        UPDATE news
+        SET tickers_json = ?
+        WHERE news_id = ?
+        """,
+        (json.dumps(tickers, ensure_ascii=False), news_id),
+    )
+    conn.execute("DELETE FROM news_tickers WHERE news_id = ?", (news_id,))
+    conn.executemany(
+        """
+        INSERT INTO news_tickers (
+            news_id,
+            ticker,
+            matched_by,
+            matched_terms_json,
+            created_at_msk
+        )
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                news_id,
+                match.ticker,
+                match.matched_by,
+                json.dumps(list(match.matched_terms), ensure_ascii=False),
+                now_msk,
+            )
+            for match in ticker_matches
+        ],
+    )
 
 
 def _news_id(item: NewsItem, raw_payload_hash: str) -> str:

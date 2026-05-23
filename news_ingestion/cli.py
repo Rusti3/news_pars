@@ -16,6 +16,12 @@ from news_ingestion.pipeline import IngestionPipeline, SourceRunStats
 from news_ingestion.scheduler import create_scheduler
 from news_ingestion.settings import Settings, get_settings
 from news_ingestion.storage import count_news, initialize_database, sync_sources
+from news_ingestion.tickers import (
+    TickerRegistry,
+    TickerStats,
+    tag_existing_news,
+    ticker_stats,
+)
 
 
 def main() -> None:
@@ -27,6 +33,8 @@ def main() -> None:
     subparsers.add_parser("list-sources")
     subparsers.add_parser("bootstrap")
     subparsers.add_parser("dedup")
+    subparsers.add_parser("tag-tickers")
+    subparsers.add_parser("ticker-stats")
 
     dedup_stats_parser = subparsers.add_parser("dedup-stats")
     dedup_stats_parser.add_argument("--limit", type=int, default=20)
@@ -50,7 +58,18 @@ def main() -> None:
         _print_story_clusters(settings.database_path, args.limit)
         return
 
+    if args.command == "ticker-stats":
+        _print_ticker_stats(ticker_stats(settings.database_path))
+        return
+
     registry = SourceRegistry.load(settings.sources_config_path)
+    ticker_registry = TickerRegistry.load(settings.tickers_config_path)
+
+    if args.command == "tag-tickers":
+        _print_ticker_stats(
+            tag_existing_news(settings.database_path, ticker_registry, registry.sources)
+        )
+        return
 
     if args.command == "init-db":
         initialize_database(settings.database_path)
@@ -154,6 +173,18 @@ def _print_story_clusters(database_path, limit: int) -> None:
                 f"  - {item.event_at_msk} | {item.source} | "
                 f"score={item.score:g} | {item.title}"
             )
+
+
+def _print_ticker_stats(stats: TickerStats) -> None:
+    print(
+        "tickers: "
+        f"total_news={stats.total_news} "
+        f"tagged_news={stats.tagged_news} "
+        f"untagged_news={stats.untagged_news} "
+        f"multi_ticker_news={stats.multi_ticker_news}"
+    )
+    for ticker, count in stats.ticker_counts.items():
+        print(f"  {ticker}: {count}")
 
 
 def _configure_output_encoding() -> None:

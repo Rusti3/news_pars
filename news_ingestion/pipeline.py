@@ -19,6 +19,7 @@ from news_ingestion.storage import (
     sync_sources,
     update_source_watermark,
 )
+from news_ingestion.tickers import TickerRegistry
 
 
 @dataclass
@@ -63,6 +64,7 @@ class IngestionPipeline:
     def __init__(self, registry: SourceRegistry, settings: Settings):
         self.registry = registry
         self.settings = settings
+        self.ticker_registry = TickerRegistry.load(settings.tickers_config_path)
         self._initialized = False
         self._initialize_lock = Lock()
         self._dedup_lock = Lock()
@@ -180,7 +182,11 @@ class IngestionPipeline:
                 continue
 
             stats.selected += 1
-            result = save_news_item(self.settings.database_path, normalized)
+            result = save_news_item(
+                self.settings.database_path,
+                normalized,
+                ticker_matches=self.ticker_registry.tag_item(normalized, source),
+            )
             watermark_accumulator.observe(normalized)
             if result.created:
                 stats.saved += 1
@@ -218,7 +224,11 @@ class IngestionPipeline:
                 stats.skipped += 1
                 continue
 
-            result = save_news_item(self.settings.database_path, normalized)
+            result = save_news_item(
+                self.settings.database_path,
+                normalized,
+                ticker_matches=self.ticker_registry.tag_item(normalized, source),
+            )
             watermark_accumulator.observe(normalized)
             if result.created:
                 stats.saved += 1

@@ -8,6 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     database_path: Path = Path("news.sqlite3")
     sources_config_path: Path = Path("configs/sources.yaml")
+    tickers_config_path: Path = Path("configs/tickers.yaml")
     request_timeout_seconds: float = Field(default=20.0, gt=0.0)
     news_scheduler_enabled: bool = True
     bootstrap_enabled: bool = True
