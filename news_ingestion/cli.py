@@ -6,6 +6,12 @@ import sys
 from collections.abc import Iterable
 
 from news_ingestion.config import SourceRegistry
+from news_ingestion.dedup import (
+    StoryDedupStats,
+    rebuild_story_clusters,
+    story_cluster_report,
+    story_dedup_stats,
+)
 from news_ingestion.pipeline import IngestionPipeline, SourceRunStats
 from news_ingestion.scheduler import create_scheduler
 from news_ingestion.settings import Settings, get_settings
@@ -20,6 +26,10 @@ def main() -> None:
     subparsers.add_parser("init-db")
     subparsers.add_parser("list-sources")
     subparsers.add_parser("bootstrap")
+    subparsers.add_parser("dedup")
+
+    dedup_stats_parser = subparsers.add_parser("dedup-stats")
+    dedup_stats_parser.add_argument("--limit", type=int, default=20)
 
     ingest_parser = subparsers.add_parser("ingest")
     ingest_parser.add_argument("source_id", nargs="?")
@@ -28,6 +38,18 @@ def main() -> None:
 
     args = parser.parse_args()
     settings = get_settings()
+
+    if args.command == "dedup":
+        stats = rebuild_story_clusters(settings.database_path)
+        _print_dedup_stats(stats)
+        return
+
+    if args.command == "dedup-stats":
+        stats = story_dedup_stats(settings.database_path)
+        _print_dedup_stats(stats)
+        _print_story_clusters(settings.database_path, args.limit)
+        return
+
     registry = SourceRegistry.load(settings.sources_config_path)
 
     if args.command == "init-db":
@@ -106,6 +128,32 @@ def _print_stats(results: Iterable[SourceRunStats]) -> None:
         )
         for error in result.errors:
             print(f"  error: {error}")
+
+
+def _print_dedup_stats(stats: StoryDedupStats) -> None:
+    print(
+        "dedup: "
+        f"total_news={stats.total_news} "
+        f"story_clusters={stats.story_clusters} "
+        f"clustered_items={stats.clustered_items} "
+        f"deduplicated_items={stats.deduplicated_items} "
+        f"unique_stories={stats.unique_stories}"
+    )
+
+
+def _print_story_clusters(database_path, limit: int) -> None:
+    for index, cluster in enumerate(story_cluster_report(database_path, limit=limit), start=1):
+        print(
+            f"#{index} {cluster.story_id}: "
+            f"items={cluster.item_count} sources={cluster.source_count} "
+            f"first={cluster.first_published_at_msk} last={cluster.last_published_at_msk}"
+        )
+        print(f"  canonical: {cluster.canonical_title}")
+        for item in cluster.items:
+            print(
+                f"  - {item.event_at_msk} | {item.source} | "
+                f"score={item.score:g} | {item.title}"
+            )
 
 
 def _configure_output_encoding() -> None:

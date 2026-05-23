@@ -7,6 +7,7 @@ from threading import Lock
 from news_ingestion.adapters import build_adapter
 from news_ingestion.cleaning import clean_text
 from news_ingestion.config import SourceRegistry
+from news_ingestion.dedup import rebuild_story_clusters
 from news_ingestion.schemas import NewsItem, ParserConfig, SourceConfig
 from news_ingestion.settings import Settings
 from news_ingestion.storage import (
@@ -64,6 +65,7 @@ class IngestionPipeline:
         self.settings = settings
         self._initialized = False
         self._initialize_lock = Lock()
+        self._dedup_lock = Lock()
 
     def initialize(self) -> None:
         if self._initialized:
@@ -85,17 +87,27 @@ class IngestionPipeline:
         self.initialize()
         results: list[SourceRunStats] = []
         for source in self.enabled_sources():
-            results.append(await self.run_source(source.id))
+            results.append(await self.run_source(source.id, dedup_after=False))
+        if any(result.saved for result in results):
+            self._rebuild_story_clusters(results)
         return results
 
     async def bootstrap(self) -> list[SourceRunStats]:
         self.initialize()
         results: list[SourceRunStats] = []
         for source in self.enabled_sources():
-            results.append(await self.run_source(source.id, bootstrap=True))
+            results.append(await self.run_source(source.id, bootstrap=True, dedup_after=False))
+        if any(result.saved for result in results):
+            self._rebuild_story_clusters(results)
         return results
 
-    async def run_source(self, source_id: str, *, bootstrap: bool = False) -> SourceRunStats:
+    async def run_source(
+        self,
+        source_id: str,
+        *,
+        bootstrap: bool = False,
+        dedup_after: bool = True,
+    ) -> SourceRunStats:
         self.initialize()
         base_source = self.get_source(source_id)
         source = _with_max_items(
@@ -132,8 +144,19 @@ class IngestionPipeline:
         except Exception as exc:
             stats.errors.append(str(exc))
 
+        if dedup_after and stats.saved > 0:
+            self._rebuild_story_clusters([stats])
+
         stats.finish()
         return stats
+
+    def _rebuild_story_clusters(self, stats: list[SourceRunStats]) -> None:
+        try:
+            with self._dedup_lock:
+                rebuild_story_clusters(self.settings.database_path)
+        except Exception as exc:
+            if stats:
+                stats[0].errors.append(f"story dedup failed: {exc}")
 
     async def _stream_source_items(
         self,

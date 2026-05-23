@@ -51,6 +51,7 @@ def initialize_database(database_path: str | Path) -> None:
             """
         )
         _ensure_news_table(conn)
+        _ensure_story_tables(conn)
         conn.executescript(
             """
             CREATE INDEX IF NOT EXISTS ix_news_source_received_at
@@ -251,6 +252,38 @@ def _ensure_news_table(conn: sqlite3.Connection) -> None:
 
     if legacy_table:
         _copy_legacy_news(conn, legacy_table)
+
+
+def _ensure_story_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS story_clusters (
+            story_id TEXT PRIMARY KEY,
+            canonical_title TEXT,
+            first_published_at_msk TEXT,
+            last_published_at_msk TEXT,
+            item_count INTEGER NOT NULL,
+            source_count INTEGER NOT NULL,
+            sources_json TEXT NOT NULL,
+            created_at_msk TEXT NOT NULL,
+            updated_at_msk TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS story_cluster_items (
+            story_id TEXT NOT NULL,
+            news_id TEXT NOT NULL PRIMARY KEY,
+            source TEXT NOT NULL,
+            score REAL NOT NULL,
+            matched_news_id TEXT,
+            created_at_msk TEXT NOT NULL,
+            FOREIGN KEY(story_id) REFERENCES story_clusters(story_id) ON DELETE CASCADE,
+            FOREIGN KEY(news_id) REFERENCES news(news_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS ix_story_cluster_items_story_id
+            ON story_cluster_items(story_id);
+        CREATE INDEX IF NOT EXISTS ix_story_clusters_updated_at
+            ON story_clusters(updated_at_msk DESC);
+        """
+    )
 
 
 def _copy_legacy_news(conn: sqlite3.Connection, legacy_table: str) -> None:
