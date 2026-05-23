@@ -41,7 +41,7 @@ class HTMLNewsAdapter(NewsSourceAdapter):
         base_host = urlparse(str(self.config.url)).netloc
         source_url = _normalize_url(str(self.config.url))
 
-        links: list[str] = []
+        candidates: list[str] = []
         seen: set[str] = set()
         for anchor in anchors:
             href = anchor.get("href")
@@ -55,15 +55,14 @@ class HTMLNewsAdapter(NewsSourceAdapter):
             if (
                 absolute == source_url
                 or absolute in seen
-                or absolute in self._known_external_ids
                 or not self._is_allowed_link(absolute)
             ):
                 continue
-            links.append(absolute)
+            candidates.append(absolute)
             seen.add(absolute)
-            if len(links) >= max_items:
+            if len(candidates) >= max_items:
                 break
-        return links
+        return [link for link in candidates if link not in self._known_external_ids]
 
     async def extract_article(self, url: str) -> NewsItem | None:
         html = await self._fetch_html(url)

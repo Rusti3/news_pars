@@ -58,6 +58,8 @@ class StubHTMLAdapter(HTMLNewsAdapter):
             return """
             <html><body>
               <a href="/news/item-1">Item 1</a>
+              <a href="/news/item-2">Item 2</a>
+              <a href="/news/old-item-3">Old Item 3</a>
             </body></html>
             """
         return """
@@ -86,7 +88,7 @@ async def test_html_adapter_discovers_and_extracts_article(tmp_path) -> None:
             "title_selector": "h1",
             "article_selector": "article",
             "link_allow_patterns": ["/news/"],
-            "max_items": 2,
+            "max_items": 1,
         },
     )
     adapter = StubHTMLAdapter(config, _settings(tmp_path))
@@ -99,6 +101,35 @@ async def test_html_adapter_discovers_and_extracts_article(tmp_path) -> None:
     assert item.external_id == "https://example.com/news/item-1"
     assert item.title == "HTML title"
     assert "Full article text" in item.text
+
+
+@pytest.mark.asyncio
+async def test_html_adapter_does_not_backfill_known_top_links(tmp_path) -> None:
+    config = SourceConfig(
+        id="html_source",
+        name="HTML Source",
+        type="media_analysis",
+        method="html",
+        url="https://example.com/news",
+        interval_seconds=30,
+        trust_score=0.7,
+        parser={
+            "list_item_selector": "a[href]",
+            "link_allow_patterns": ["/news/"],
+            "max_items": 2,
+        },
+    )
+    adapter = StubHTMLAdapter(config, _settings(tmp_path))
+    adapter.set_known_external_ids(
+        {
+            "https://example.com/news/item-1",
+            "https://example.com/news/item-2",
+        }
+    )
+
+    links = await adapter.discover_article_links()
+
+    assert links == []
 
 
 def test_disclosure_parser_reads_list_and_detail() -> None:
